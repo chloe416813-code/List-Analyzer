@@ -144,9 +144,9 @@ with st.sidebar:
     st.header("⚙️ 欄位設定")
     st.info("請輸入您 Excel 檔案中【第一列表頭】的準確名稱。")
     
-    col_city_input = st.text_input("1. [縣市] 欄位名稱", value="居住縣市")
-    col_school_input = st.text_input("2. [學校] 欄位名稱", value="就讀學校")
-    col_role_input = st.text_input("3. [職稱/身分] 欄位名稱", value="身分")
+    col_city_input = st.text_input("1. 欄位名稱", value="居住縣市")
+    col_school_input = st.text_input("2. 欄位名稱", value="就讀學校")
+    col_role_input = st.text_input("3. 欄位名稱", value="OO人數")
     
     st.divider()
     pwd_input = st.text_input("檔案密碼 (若無則留空)", type="password")
