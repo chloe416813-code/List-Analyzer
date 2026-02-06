@@ -8,9 +8,9 @@ import openpyxl
 from openpyxl.styles import PatternFill
 
 # ================= 0. 系統設定 =================
-st.set_page_config(page_title="科普列車統計系統 V8.0", page_icon="🚄", layout="wide")
+st.set_page_config(page_title="科普列車統計系統 V8.1", page_icon="🚄", layout="wide")
 
-# 初始化 Session State (確保按鈕不會消失)
+# 初始化 Session State
 if 'analysis_done' not in st.session_state:
     st.session_state.analysis_done = False
 if 'result_zip' not in st.session_state:
@@ -69,17 +69,11 @@ def open_excel_safe(file_content, password):
     return None
 
 def get_single_col_name(columns, keywords):
-    """ 
-    嚴格篩選：只回傳【第一個】符合的欄位名稱。
-    避免因為多個欄位包含相同關鍵字而導致 Pandas 錯誤。
-    """
-    # 1. 先找完全符合的 (優先權高)
+    """ 嚴格篩選：只回傳【第一個】符合的欄位名稱 """
     for col in columns:
         col_str = str(col).strip()
         if col_str in keywords:
             return col
-            
-    # 2. 再找包含關鍵字的
     for col in columns:
         col_str = str(col).strip()
         if any(k in col_str for k in keywords):
@@ -87,11 +81,6 @@ def get_single_col_name(columns, keywords):
     return None
 
 def process_file_logic(filename, content, password):
-    """ 
-    V8.0 核心邏輯：
-    1. 檢查並標記黃底 (針對原始檔案結構)。
-    2. 強制萃取 [縣市, 學校, 職稱] 三欄，並丟棄其他所有欄位，確保統計單純化。
-    """
     wb = open_excel_safe(content, password)
     if wb is None:
         return None, None, {"filename": filename, "status": "Fail", "msg": "無法開啟 (密碼錯誤或格式不支援)"}
@@ -106,32 +95,33 @@ def process_file_logic(filename, content, password):
             header_row_idx = r_idx
             break
     
-    # --- B. 讀取資料 ---
+    # --- B. 讀取資料並【去重複】 ---
     data = list(ws.values)
     if not data: return None, None, {"filename": filename, "status": "Fail", "msg": "空檔案"}
     
-    header = data[header_row_idx]
+    raw_header = data[header_row_idx]
     rows = data[header_row_idx+1:]
-    df = pd.DataFrame(rows, columns=header)
     
-    # 清理欄位名稱 (轉字串並去空白)
+    # 建立 DataFrame
+    df = pd.DataFrame(rows, columns=raw_header)
+    
+    # === 關鍵修正：處理重複欄位名稱 ===
+    # 如果 Excel 有兩個「職稱」欄位，pandas 會造成 Grouper error
+    # 我們這裡強制重新命名重複的欄位
     df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()] # 只保留第一個出現的欄位
+    
     cols = list(df.columns)
     
-    # --- C. 定義關鍵字 ---
-    # 檢查用
+    # --- C. 關鍵字定義 ---
     key_id = ['身分證', 'ID', '證號', '身分證字號']
     key_birth = ['生日', '出生', 'Birth', '出生年月日']
-    
-    # 統計用 (儀表板重點)
     key_city = ['縣市', '城市', 'City', '地區', '居住地', '縣市別']
     key_school = ['學校', '校名', 'School', '單位', '就讀學校', '學校名稱']
     key_role = ['職稱', '身分', '身份', 'Role', '職務', '對象', '類別', '師生']
 
-    # 尋找欄位 (使用嚴格篩選，只抓一個)
     col_id = get_single_col_name(cols, key_id)
     col_birth = get_single_col_name(cols, key_birth)
-    
     col_city = get_single_col_name(cols, key_city)
     col_school = get_single_col_name(cols, key_school)
     col_role = get_single_col_name(cols, key_role)
@@ -141,18 +131,19 @@ def process_file_logic(filename, content, password):
     if not col_id or not col_birth:
         return None, None, {"filename": filename, "status": "Fail", "msg": "找不到關鍵欄位 (身分證/生日)"}
 
-    # --- D. 執行黃底檢查 (針對原始結構) ---
+    # --- D. 黃底檢查 (僅標記) ---
     wb_out = open_excel_safe(content, password)
     ws_out = wb_out.active
     YELLOW = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
     
-    # 重新對應 openpyxl 的 index
-    op_header = list(ws_out.iter_rows(min_row=header_row_idx+1, max_row=header_row_idx+1, values_only=True))[0]
-    op_header = [str(c).strip() for c in op_header]
+    # 重新對應 index (針對 openpyxl)
+    op_header_row = list(ws_out.iter_rows(min_row=header_row_idx+1, max_row=header_row_idx+1, values_only=True))[0]
+    op_header_str = [str(c).strip() for c in op_header_row]
     
     try:
-        idx_id = op_header.index(col_id)
-        idx_birth = op_header.index(col_birth)
+        # 找出 openpyxl 對應的 index (只找第一個匹配的)
+        idx_id = op_header_str.index(col_id)
+        idx_birth = op_header_str.index(col_birth)
         
         for row in ws_out.iter_rows(min_row=header_row_idx+2):
             # 生日
@@ -174,49 +165,30 @@ def process_file_logic(filename, content, password):
                     cell.fill = YELLOW
                     stats_meta["errors"] += 1
     except:
-        stats_meta["msg"] = "檢查過程發生索引錯誤，但仍嘗試統計"
+        stats_meta["msg"] = "檢查過程發生索引警告 (不影響統計)"
 
     output = io.BytesIO()
     wb_out.save(output)
     output.seek(0)
     
-    # --- E. 萃取純淨統計資料 (解決 Grouper error 的關鍵) ---
-    # 我們建立一個全新的 DataFrame，只放我們要的欄位，並強制改名
-    
+    # --- E. 萃取純淨統計資料 ---
     clean_data = {}
     
-    # 1. 處理縣市
-    if col_city:
-        clean_data['縣市'] = df[col_city]
-    else:
-        clean_data['縣市'] = '未填縣市'
-        
-    # 2. 處理學校
-    if col_school:
-        clean_data['學校'] = df[col_school]
-    else:
-        clean_data['學校'] = '未填學校'
-        
-    # 3. 處理職稱 (最容易出錯的地方)
+    clean_data['縣市'] = df[col_city] if col_city else '未填縣市'
+    clean_data['學校'] = df[col_school] if col_school else '未填學校'
+    
     if col_role:
         clean_data['職稱'] = df[col_role]
     else:
-        # 如果找不到職稱欄位，嘗試從生日推算 (未滿15當學生，其他當成人/老師)
-        # 這是一個 fallback 邏輯
+        # 若無職稱欄位，用生日推算
         def guess_role(row):
-            b_val = row.get(col_birth)
-            dt = parse_roc_birthday(b_val)
+            dt = parse_roc_birthday(row.get(col_birth))
             if dt:
-                age = calculate_age(dt)
-                return '學生' if age < 15 else '師長/成人'
+                return '學生' if calculate_age(dt) < 15 else '師長/成人'
             return '一般'
-        
         clean_data['職稱'] = df.apply(guess_role, axis=1)
 
-    # 建立純淨 DataFrame
     df_stat = pd.DataFrame(clean_data)
-    
-    # 填充空值，避免統計錯誤
     df_stat.fillna("未知", inplace=True)
     
     return output, df_stat, stats_meta
@@ -239,12 +211,10 @@ def run_analysis(files, pwd):
                 processed_files.append((f"已檢查_{f.name}", excel_data.getvalue()))
             
             if df_stat is not None:
-                # 記錄來源檔案，方便追蹤
                 df_stat['來源檔案'] = f.name
-                # 合併到總表
                 combined_df = pd.concat([combined_df, df_stat], ignore_index=True)
         except Exception as e:
-            st.error(f"處理檔案 {f.name} 時發生錯誤: {e}")
+            st.error(f"檔案 {f.name} 處理失敗: {e}")
             
         progress_bar.progress((i + 1) / len(files))
         
@@ -252,9 +222,9 @@ def run_analysis(files, pwd):
 
 # ================= 3. 主介面 =================
 
-st.title("🚄 科普列車 - 統計戰情室 V8.0")
+st.title("🚄 科普列車 - 統計戰情室 V8.1")
 st.markdown("### 專注於：縣市、學校、師生人數統計")
-st.info("系統將忽略 Excel 中的無關欄位，只抓取重點並產生報表。")
+st.info("已修正 Grouper error，系統將自動過濾重複欄位。")
 
 col1, col2 = st.columns([1, 2])
 with col1:
@@ -272,7 +242,7 @@ if st.button("🚀 開始分析 & 產生報表", type="primary"):
         with st.spinner("正在進行智慧欄位辨識與統計..."):
             res_files, meta_list, big_df = run_analysis(files_input, pwd_input)
             
-            # 儲存結果到 Session State
+            # 存 Session State
             if res_files:
                 z = io.BytesIO()
                 with zipfile.ZipFile(z, "w") as zf:
@@ -284,13 +254,68 @@ if st.button("🚀 開始分析 & 產生報表", type="primary"):
             if not big_df.empty:
                 try:
                     stats_io = io.BytesIO()
-                    # 製作樞紐分析表 (這步之前會報錯，現在因為欄位乾淨了，不會錯)
+                    # 樞紐分析
                     pivot = big_df.pivot_table(index=['縣市', '學校'], columns='職稱', aggfunc='size', fill_value=0)
-                    # 計算該校總計
                     pivot['該校總計'] = pivot.sum(axis=1)
                     
                     with pd.ExcelWriter(stats_io, engine='xlsxwriter') as writer:
-                        # 分頁 1: 各校統計
                         pivot.to_excel(writer, sheet_name='各校統計')
+                        big_df['縣市'].value_counts().to_frame(name="人數").to_excel(writer, sheet_name='縣市統計')
+                        big_df.to_excel(writer, sheet_name='總名單明細', index=False)
+                        writer.sheets['各校統計'].set_column(0, 1, 20)
                         
-                        # 分頁 2: 縣市統計
+                    st.session_state.stats_excel = stats_io.getvalue()
+                    st.session_state.big_df = big_df
+                    
+                except Exception as e:
+                    st.error(f"統計報表產生失敗: {e}")
+            
+            st.session_state.meta_report = meta_list
+            st.session_state.analysis_done = True
+
+# ================= 4. 結果顯示區 =================
+
+if st.session_state.analysis_done:
+    st.divider()
+    
+    if not st.session_state.big_df.empty:
+        df = st.session_state.big_df
+        st.subheader("📊 統計儀表板")
+        
+        m1, m2, m3 = st.columns(3)
+        m1.metric("總參與人數", f"{len(df)} 人")
+        m2.metric("涵蓋縣市", f"{df['縣市'].nunique()} 個")
+        m3.metric("參與學校", f"{df['學校'].nunique()} 所")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### 🌍 各縣市人數")
+            st.bar_chart(df['縣市'].value_counts())
+        with c2:
+            st.markdown("#### 🎓 師生職稱比例")
+            st.bar_chart(df['職稱'].value_counts(), color="#ffaa00")
+
+    st.subheader("📥 下載報告")
+    d1, d2 = st.columns(2)
+    
+    with d1:
+        if st.session_state.stats_excel:
+            st.download_button(
+                label="📊 下載統計報表 (.xlsx)",
+                data=st.session_state.stats_excel,
+                file_name="科普列車_統計報表.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
+            
+    with d2:
+        if st.session_state.result_zip:
+            st.download_button(
+                label="📦 下載已檢查原始檔 (ZIP)",
+                data=st.session_state.result_zip,
+                file_name="檢查結果_黃底標記.zip",
+                mime="application/zip"
+            )
+            
+    with st.expander("查看檢查詳細日誌"):
+        st.dataframe(pd.DataFrame(st.session_state.meta_report))
