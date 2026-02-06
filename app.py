@@ -96,7 +96,7 @@ st.title("📊 科普列車 - 縣市學校統計戰情室 V12.0")
 
 # --- 左側設定區 ---
 with st.sidebar:
-    st.header("1. 欄位對應設定")
+    st.header("2. 欄位對應設定")
     st.info("請告訴系統，您的 Excel 裡這些欄位叫什麼？")
     
     input_city = st.text_input("縣市欄位名稱", value="居住縣市")
