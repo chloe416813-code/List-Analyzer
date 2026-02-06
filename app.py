@@ -1,27 +1,22 @@
 import streamlit as st
 import pandas as pd
 import io
-import zipfile
 import xlsxwriter
 import openpyxl
 
 # ================= 0. 系統設定 =================
-st.set_page_config(page_title="萬用 Excel 統計系統 V11.0", page_icon="🧩", layout="wide")
+st.set_page_config(page_title="科普列車統計系統 V12.0", page_icon="📊", layout="wide")
 
 # 初始化 Session State
-if 'analysis_done' not in st.session_state:
-    st.session_state.analysis_done = False
-if 'stats_excel' not in st.session_state:
-    st.session_state.stats_excel = None
-if 'big_df' not in st.session_state:
-    st.session_state.big_df = pd.DataFrame()
-if 'log_report' not in st.session_state:
-    st.session_state.log_report = []
+if 'merged_df' not in st.session_state:
+    st.session_state.merged_df = pd.DataFrame()
+if 'step' not in st.session_state:
+    st.session_state.step = 1 # 1:上傳, 2:設定職稱, 3:看結果
 
 # ================= 1. 核心邏輯區 =================
 
 def open_excel_safe(file_content, password):
-    """ 安全開啟 Excel (支援加密) """
+    """ 安全開啟 Excel """
     file_stream = io.BytesIO(file_content)
     try:
         return openpyxl.load_workbook(file_stream, data_only=True)
@@ -41,233 +36,237 @@ def open_excel_safe(file_content, password):
             return None
     return None
 
-def process_file_dynamic(filename, content, password, target_cols_list):
+def extract_data(filename, content, password, user_cols_map):
     """
-    V11.0 核心：依據使用者在表格中設定的欄位清單進行抓取
+    抓取資料並標準化欄位名稱
+    user_cols_map = {'city': '居住縣市', 'school': '就讀學校', 'role': '身分'}
     """
     wb = open_excel_safe(content, password)
-    if wb is None:
-        return None, {"filename": filename, "status": "Fail", "msg": "無法開啟(密碼錯誤)"}
-
+    if wb is None: return None
     ws = wb.active
     
-    # 1. 找表頭
-    # 邏輯：掃描前 10 行，只要該行包含了使用者指定欄位的「任意一個」，就認定是表頭
-    header_row_idx = 0
-    found_header = False
-    
-    # 為了提高命中率，我們把使用者輸入的欄位都轉字串並去空白
-    target_set = set([str(c).strip() for c in target_cols_list])
+    # 找表頭
+    header_idx = 0
+    found = False
+    # 搜尋前 10 行，看哪一行包含了使用者設定的「學校」欄位名稱
+    target_key = user_cols_map['school'].strip()
     
     for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=10, values_only=True)):
-        # 讀取這一行的內容，轉成乾淨的清單
-        row_values = [str(c).strip() for c in row if c is not None]
-        
-        # 檢查是否有交集 (這一行是否包含使用者要的欄位)
-        # 只要命中 1 個，我們就假設這是表頭行
-        if set(row_values).intersection(target_set):
-            header_row_idx = r_idx
-            found_header = True
+        row_str = [str(c).strip() for c in row if c is not None]
+        if target_key in row_str:
+            header_idx = r_idx
+            found = True
             break
             
-    if not found_header:
-        return None, {"filename": filename, "status": "Fail", "msg": f"找不到符合設定的表頭，請確認 Excel 欄位名稱。"}
+    if not found: return None # 找不到表頭
 
-    # 2. 讀取資料
+    # 讀取資料
     data = list(ws.values)
-    raw_header = data[header_row_idx]
-    rows = data[header_row_idx+1:]
+    raw_header = data[header_idx]
+    rows = data[header_idx+1:]
     
     df = pd.DataFrame(rows, columns=raw_header)
+    df.columns = [str(c).strip() for c in df.columns] # 清洗欄位名
     
-    # 清理 DataFrame 欄位名稱
-    df.columns = [str(c).strip() for c in df.columns]
-    
-    # 3. 萃取使用者指定的欄位
+    # 萃取並重新命名欄位 (標準化)
+    # 我們將使用者 Excel 裡千奇百怪的欄位名，統一改成 'City', 'School', 'Role'
     clean_data = {}
-    missing_cols = []
-
-    for col_name in target_cols_list:
-        clean_col = str(col_name).strip()
+    
+    # 對應 City
+    col_city = user_cols_map['city'].strip()
+    if col_city in df.columns: clean_data['City'] = df[col_city]
+    else: clean_data['City'] = '未知縣市'
         
-        # 嘗試在 Excel 中找這個欄位 (完全匹配)
-        if clean_col in df.columns:
-             clean_data[clean_col] = df[clean_col]
-        else:
-             # 嘗試模糊匹配 (例如使用者設「學校」，可以抓到「就讀學校」)
-             found_fuzzy = False
-             for excel_col in df.columns:
-                 if clean_col in excel_col:
-                     clean_data[clean_col] = df[excel_col] # 統一使用使用者設定的名稱當 Key
-                     found_fuzzy = True
-                     break
-             
-             if not found_fuzzy:
-                 clean_data[clean_col] = "未找到"
-                 missing_cols.append(clean_col)
-
-    df_stat = pd.DataFrame(clean_data)
-    df_stat.fillna("", inplace=True)
-    
-    msg = "OK"
-    status = "Success"
-    if missing_cols:
-        msg = f"部分未找到: {', '.join(missing_cols)}"
-        status = "Warning"
-    
-    return df_stat, {"filename": filename, "status": status, "msg": msg}
-
-# ================= 2. 批量執行 =================
-
-def run_analysis(files, pwd, target_cols_list):
-    log_list = []
-    combined_df = pd.DataFrame() 
-    
-    progress_bar = st.progress(0)
-    
-    for i, f in enumerate(files):
-        try:
-            df_stat, meta = process_file_dynamic(f.name, f.read(), pwd, target_cols_list)
-            log_list.append(meta)
-            
-            if df_stat is not None:
-                df_stat['來源檔案'] = f.name
-                combined_df = pd.concat([combined_df, df_stat], ignore_index=True)
-        except Exception as e:
-            st.error(f"檔案 {f.name} 處理失敗: {e}")
-            
-        progress_bar.progress((i + 1) / len(files))
+    # 對應 School
+    col_school = user_cols_map['school'].strip()
+    if col_school in df.columns: clean_data['School'] = df[col_school]
+    else: clean_data['School'] = '未知學校'
         
-    return log_list, combined_df
+    # 對應 Role
+    col_role = user_cols_map['role'].strip()
+    if col_role in df.columns: clean_data['Role'] = df[col_role]
+    else: clean_data['Role'] = '未知'
 
-# ================= 3. 主介面 =================
+    return pd.DataFrame(clean_data)
 
-st.title("🧩 萬用 Excel 統計系統 V11.0")
-st.markdown("### 完全自定義：您想抓什麼欄位，自己決定！")
+# ================= 2. 主介面 =================
+
+st.title("📊 科普列車 - 縣市學校統計戰情室 V12.0")
+st.markdown("### 專注目標：算出各縣市有【幾間學校】、【幾位老師】、【幾位學生】")
 
 # --- 左側設定區 ---
 with st.sidebar:
-    st.header("1. 設定分析欄位")
-    st.info("請在下方表格新增您想要分析的 Excel 欄位名稱。")
-    st.caption("例如：學校、縣市、職稱、金額...")
+    st.header("1. 欄位對應設定")
+    st.info("請告訴系統，您的 Excel 裡這些欄位叫什麼？")
     
-    # 初始化一個空的 DataFrame 給使用者輸入
-    # 這就是讓使用者「自行增減」的關鍵元件
-    default_data = pd.DataFrame([{"欄位名稱": ""}]) # 預設留空，或給一個空行
-    
-    edited_df = st.data_editor(
-        pd.DataFrame(columns=["欄位名稱"]), # 預設完全空白
-        num_rows="dynamic", # 允許使用者按 + 新增行
-        key="col_editor",
-        use_container_width=True
-    )
-    
-    # 轉換使用者輸入為清單
-    target_cols = [row["欄位名稱"] for i, row in edited_df.iterrows() if row["欄位名稱"]]
+    input_city = st.text_input("縣市欄位名稱", value="居住縣市")
+    input_school = st.text_input("學校欄位名稱", value="就讀學校")
+    input_role = st.text_input("身分/職稱欄位名稱", value="職稱")
     
     st.divider()
     pwd_input = st.text_input("檔案密碼 (若無則留空)", type="password")
+    
+    # 打包設定
+    cols_map = {'city': input_city, 'school': input_school, 'role': input_role}
 
-# --- 右側上傳區 ---
-st.header("2. 上傳檔案與執行")
-files_input = st.file_uploader("請上傳 Excel (支援多檔合併)", type=['xlsx'], accept_multiple_files=True)
-
-if st.button("🚀 開始分析", type="primary"):
-    if not files_input:
-        st.warning("請先上傳檔案！")
-    elif not target_cols:
-        st.warning("請在左側側邊欄【新增】至少一個要分析的欄位名稱！")
-    else:
-        st.session_state.big_df = pd.DataFrame()
-        
-        with st.spinner(f"正在抓取欄位: {target_cols} ..."):
-            log_list, big_df = run_analysis(files_input, pwd_input, target_cols)
+# --- 步驟 1: 上傳與讀取 ---
+if st.session_state.step == 1:
+    st.header("步驟 1: 上傳資料")
+    files = st.file_uploader("上傳 Excel (支援多檔)", type=['xlsx'], accept_multiple_files=True)
+    
+    if st.button("讀取資料 & 下一步", type="primary"):
+        if files:
+            all_dfs = []
+            bar = st.progress(0)
+            for i, f in enumerate(files):
+                df = extract_data(f.name, f.read(), pwd_input, cols_map)
+                if df is not None:
+                    df['Source'] = f.name
+                    all_dfs.append(df)
+                bar.progress((i+1)/len(files))
             
-            st.session_state.big_df = big_df
-            st.session_state.log_report = log_list
-            st.session_state.analysis_done = True
+            if all_dfs:
+                st.session_state.merged_df = pd.concat(all_dfs, ignore_index=True)
+                # 填充空值
+                st.session_state.merged_df.fillna("未知", inplace=True)
+                st.session_state.step = 2
+                st.rerun() # 重新整理進入下一步
+            else:
+                st.error("讀取失敗，請檢查欄位名稱設定是否正確。")
+        else:
+            st.warning("請先上傳檔案")
 
-# ================= 4. 結果顯示與報表設定 =================
+# --- 步驟 2: 設定統計邏輯 (這是解決您問題的關鍵) ---
+if st.session_state.step == 2:
+    st.header("步驟 2: 定義身分 (誰是老師？誰是學生？)")
+    
+    df = st.session_state.merged_df
+    
+    # 抓出 Excel 裡所有出現過的職稱
+    unique_roles = df['Role'].unique().tolist()
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("🧑‍🏫 哪些職稱算「老師/成人」？")
+        # 讓使用者多選
+        teacher_list = st.multiselect("請勾選 (可多選)", unique_roles, default=[r for r in unique_roles if '師' in str(r) or '長' in str(r)])
+        
+    with col2:
+        st.subheader("👶 哪些職稱算「學生」？")
+        student_list = st.multiselect("請勾選 (可多選)", unique_roles, default=[r for r in unique_roles if '生' in str(r)])
 
-if st.session_state.analysis_done:
+    st.info(f"目前資料共 {len(df)} 筆。未被勾選的職稱將不計入師生統計，但會計入總人數。")
+
+    if st.button("開始計算統計報表 🚀", type="primary"):
+        # 開始進行聚合分析 (Aggregation)
+        
+        # 1. 先把每一列標記是老師還是學生
+        def tag_role(role_val):
+            if role_val in teacher_list: return 'Teacher'
+            if role_val in student_list: return 'Student'
+            return 'Other'
+            
+        df['Tag'] = df['Role'].apply(tag_role)
+        
+        # 2. 進行 GroupBy 統計
+        # 我們要對 [City] 進行分組
+        # 計算 School 的 nunique (不重複數量)
+        # 計算 Tag 的 count
+        
+        summary_list = []
+        
+        # 針對每個縣市進行迴圈統計
+        for city, group in df.groupby('City'):
+            # 該縣市有多少間不重複的學校
+            school_count = group['School'].nunique()
+            
+            # 該縣市有多少老師
+            teacher_count = len(group[group['Tag'] == 'Teacher'])
+            
+            # 該縣市有多少學生
+            student_count = len(group[group['Tag'] == 'Student'])
+            
+            # 該縣市總人數 (包含未分類的)
+            total_count = len(group)
+            
+            summary_list.append({
+                '縣市': city,
+                '學校數': school_count,
+                '老師人數': teacher_count,
+                '學生人數': student_count,
+                '總參與人數': total_count
+            })
+            
+        # 轉成 DataFrame
+        summary_df = pd.DataFrame(summary_list)
+        
+        # 排序 (依總人數多到少)
+        summary_df = summary_df.sort_values(by='總參與人數', ascending=False).reset_index(drop=True)
+        
+        # 存入 Session 供下載
+        st.session_state.summary_df = summary_df
+        
+        # 另外做一張「各校明細表」
+        # Group by City AND School
+        school_list = []
+        for (city, school), group in df.groupby(['City', 'School']):
+            t_c = len(group[group['Tag'] == 'Teacher'])
+            s_c = len(group[group['Tag'] == 'Student'])
+            school_list.append({
+                '縣市': city,
+                '學校': school,
+                '老師人數': t_c,
+                '學生人數': s_c,
+                '該校總計': len(group)
+            })
+        st.session_state.school_df = pd.DataFrame(school_list)
+        
+        st.session_state.step = 3
+        st.rerun()
+
+# --- 步驟 3: 顯示結果與下載 ---
+if st.session_state.step == 3:
+    st.header("步驟 3: 分析結果")
+    
+    summary_df = st.session_state.summary_df
+    school_df = st.session_state.school_df
+    
+    # 1. 顯示總表 (這就是您要的！)
+    st.subheader("🏆 縣市統計總表")
+    st.dataframe(summary_df, use_container_width=True)
+    
+    # 2. 顯示圖表
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("##### 各縣市學校數")
+        st.bar_chart(summary_df.set_index('縣市')['學校數'])
+    with c2:
+        st.markdown("##### 各縣市參與人數")
+        st.bar_chart(summary_df.set_index('縣市')['總參與人數'])
+
+    # 3. 下載
     st.divider()
     
-    # 顯示處理日誌
-    with st.expander("📄 處理狀態報告", expanded=False):
-        st.dataframe(pd.DataFrame(st.session_state.log_report), use_container_width=True)
-
-    if not st.session_state.big_df.empty:
-        df = st.session_state.big_df
+    # 製作 Excel
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        summary_df.to_excel(writer, sheet_name='縣市統計總表', index=False)
+        school_df.to_excel(writer, sheet_name='各校詳細統計', index=False)
+        st.session_state.merged_df.to_excel(writer, sheet_name='原始合併名單', index=False)
         
-        st.subheader("3. 分析結果預覽")
-        st.dataframe(df.head(), use_container_width=True)
-        st.caption(f"共擷取 {len(df)} 筆資料，來自 {df['來源檔案'].nunique()} 個檔案。")
+        # 美化
+        writer.sheets['縣市統計總表'].set_column(0, 4, 15)
+        writer.sheets['各校詳細統計'].set_column(0, 1, 20)
         
-        st.divider()
-        st.subheader("4. 產生統計報表")
-        st.info("請選擇如何統計這些資料，系統將為您產生 Excel 樞紐分析表。")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            # 讓使用者選擇「列 (Index)」(例如：縣市、學校)
-            pivot_index = st.multiselect(
-                "選擇【分類】欄位 (Row)", 
-                options=target_cols,
-                default=target_cols[:2] if len(target_cols) >= 2 else target_cols
-            )
-        with col2:
-            # 讓使用者選擇「欄 (Column)」(例如：職稱)
-            pivot_columns = st.multiselect(
-                "選擇【比較】欄位 (Column) (可選)", 
-                options=[c for c in target_cols if c not in pivot_index]
-            )
-            
-        if st.button("📊 產生並下載 Excel 報表"):
-            try:
-                output_io = io.BytesIO()
-                with pd.ExcelWriter(output_io, engine='xlsxwriter') as writer:
-                    
-                    # 1. 總名單
-                    df.to_excel(writer, sheet_name='合併總表', index=False)
-                    
-                    # 2. 自動統計 (計數)
-                    # 針對使用者設定的每一個欄位，都做一個簡單的計數表
-                    for col in target_cols:
-                        if col in df.columns:
-                            counts = df[col].value_counts().to_frame(name="數量")
-                            counts.to_excel(writer, sheet_name=f'{col}統計')
-                    
-                    # 3. 使用者自訂的樞紐分析
-                    if pivot_index:
-                        # 這是 Pivot Table 的核心
-                        pivot = df.pivot_table(
-                            index=pivot_index, 
-                            columns=pivot_columns[0] if pivot_columns else None, 
-                            aggfunc='size', 
-                            fill_value=0
-                        )
-                        
-                        # 如果有比較欄位，加總計
-                        if pivot_columns:
-                            pivot['總計'] = pivot.sum(axis=1)
-                            
-                        pivot.to_excel(writer, sheet_name='自訂交叉分析')
-                        
-                        # 調整欄寬
-                        writer.sheets['自訂交叉分析'].set_column(0, len(pivot_index), 20)
-                
-                output_io.seek(0)
-                
-                st.download_button(
-                    label="📥 下載 Excel 完整報表",
-                    data=output_io,
-                    file_name="自訂統計報表.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary"
-                )
-                
-            except Exception as e:
-                st.error(f"報表產生錯誤 (可能是選取的欄位資料有誤): {e}")
-
-    else:
-        st.warning("沒有抓取到任何資料，請檢查欄位名稱設定。")
+    st.download_button(
+        label="📥 下載完整統計報表 (Excel)",
+        data=output.getvalue(),
+        file_name="科普列車_統計分析.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary"
+    )
+    
+    if st.button("🔄 重新分析其他檔案"):
+        st.session_state.step = 1
+        st.session_state.merged_df = pd.DataFrame()
+        st.rerun()
