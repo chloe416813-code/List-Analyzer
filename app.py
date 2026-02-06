@@ -3,16 +3,24 @@ import pandas as pd
 import io
 import zipfile
 from datetime import datetime
-import sys
+import xlsxwriter
+import openpyxl
+from openpyxl.styles import PatternFill
 
-# ================= 0. 系統環境檢查 =================
-try:
-    import openpyxl
-    import msoffcrypto
-    import xlsxwriter
-except ImportError:
-    st.error("🛑 缺少必要套件，請檢查 requirements.txt")
-    st.stop()
+# ================= 0. 系統設定 =================
+st.set_page_config(page_title="科普列車統計系統 V7.0", page_icon="📊", layout="wide")
+
+# 初始化 session state (這是解決下載按鈕消失的關鍵!)
+if 'analysis_done' not in st.session_state:
+    st.session_state.analysis_done = False
+if 'result_zip' not in st.session_state:
+    st.session_state.result_zip = None
+if 'stats_excel' not in st.session_state:
+    st.session_state.stats_excel = None
+if 'big_df' not in st.session_state:
+    st.session_state.big_df = pd.DataFrame()
+if 'meta_report' not in st.session_state:
+    st.session_state.meta_report = []
 
 # ================= 1. 核心邏輯區 =================
 REF_DATE = datetime(2025, 10, 20)
@@ -42,15 +50,17 @@ def calculate_age(born):
     return REF_DATE.year - born.year - ((REF_DATE.month, REF_DATE.day) < (born.month, born.day))
 
 def open_excel_safe(file_content, password):
-    """ 安全開啟 Excel (支援加密) """
+    """ 安全開啟 Excel (支援讀取加密檔，但不輸出加密) """
     file_stream = io.BytesIO(file_content)
     try:
         return openpyxl.load_workbook(file_stream)
     except:
         file_stream.seek(0)
     
+    # 如果直接開啟失敗，嘗試用密碼解鎖 (需安裝 msoffcrypto-tool)
     if password:
         try:
+            import msoffcrypto
             decrypted = io.BytesIO()
             office_file = msoffcrypto.OfficeFile(file_stream)
             office_file.load_key(password=password)
@@ -70,11 +80,7 @@ def find_col_name(columns, keywords):
     return None
 
 def process_file_logic(filename, content, password):
-    """ 
-    核心處理：
-    1. 檢查並標記黃底 (回傳 Excel binary)
-    2. 萃取數據 (回傳 DataFrame 供統計用)
-    """
+    """ 核心處理：檢查黃底 + 萃取統計資料 """
     wb = open_excel_safe(content, password)
     if wb is None:
         return None, None, {"filename": filename, "status": "Fail", "msg": "無法開啟 (密碼錯誤或格式不支援)"}
@@ -83,7 +89,6 @@ def process_file_logic(filename, content, password):
     
     # 1. 尋找表頭
     header_row_idx = 0
-    
     # 掃描前 5 行找關鍵字
     for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True)):
         row_str = [str(c) if c else '' for c in row]
@@ -91,7 +96,7 @@ def process_file_logic(filename, content, password):
             header_row_idx = r_idx
             break
     
-    # 2. 準備統計用的 DataFrame (重新讀取資料)
+    # 2. 準備統計用的 DataFrame
     data = list(ws.values)
     if not data: return None, None, {"filename": filename, "status": "Fail", "msg": "空檔案"}
     
@@ -120,10 +125,10 @@ def process_file_logic(filename, content, password):
     if not col_id or not col_birth:
         return None, None, {"filename": filename, "status": "Fail", "msg": "找不到關鍵欄位 (身分證/生日)"}
 
-    # 4. 檢查邏輯 (使用 openpyxl 標記黃底)
+    # 4. 檢查邏輯 (標記黃底)
+    # 為了寫入黃底，我們重新讀取 wb (因為上面只讀了值)
     wb_out = open_excel_safe(content, password)
     ws_out = wb_out.active
-    from openpyxl.styles import PatternFill
     YELLOW = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
     
     # 找出 openpyxl 中的欄位 index
@@ -161,10 +166,8 @@ def process_file_logic(filename, content, password):
     wb_out.save(output)
     output.seek(0)
     
-    # 5. 整理統計資料回傳
+    # 5. 整理統計資料
     df_stat = df.copy()
-    
-    # 統一欄位名稱
     rename_map = {}
     if col_city: rename_map[col_city] = '縣市'
     else: df_stat['縣市'] = '未填縣市'
@@ -177,151 +180,117 @@ def process_file_logic(filename, content, password):
     
     df_stat.rename(columns=rename_map, inplace=True)
     
+    # 確保欄位存在
+    for c in ['縣市', '學校', '職稱']:
+        if c not in df_stat.columns: df_stat[c] = 'Unknown'
+            
     return output, df_stat, stats_meta
 
-# ================= 2. 執行函式 =================
+# ================= 2. 批量執行 =================
 
-def run_checker_and_stats(files, pwd):
+def run_analysis(files, pwd):
     processed_files = []
     report_list = []
     combined_df = pd.DataFrame() 
     
-    bar = st.progress(0)
+    progress_bar = st.progress(0)
+    
     for i, f in enumerate(files):
         excel_data, df_stat, meta = process_file_logic(f.name, f.read(), pwd)
-        
         report_list.append(meta)
+        
         if excel_data:
             processed_files.append((f"已檢查_{f.name}", excel_data.getvalue()))
+        
         if df_stat is not None:
             df_stat['來源檔案'] = f.name
             combined_df = pd.concat([combined_df, df_stat], ignore_index=True)
             
-        bar.progress((i + 1) / len(files))
+        progress_bar.progress((i + 1) / len(files))
+        
     return processed_files, report_list, combined_df
-
-def run_encryptor_native(files, pwd):
-    """ 強制使用 xlsxwriter 原生寫入，避開 pandas 引擎衝突 """
-    processed = []
-    bar = st.progress(0)
-    for i, f in enumerate(files):
-        try:
-            content = f.read()
-            try:
-                df = pd.read_excel(io.BytesIO(content))
-            except:
-                st.error(f"❌ {f.name}: 讀取失敗。")
-                continue
-            
-            output = io.BytesIO()
-            workbook = xlsxwriter.Workbook(output, {'in_memory': True})
-            worksheet = workbook.add_worksheet()
-            
-            # 寫入
-            header = df.columns.values
-            for c, val in enumerate(header):
-                worksheet.write(0, c, str(val))
-            data = df.fillna("").values
-            for r, row in enumerate(data):
-                for c, val in enumerate(row):
-                    worksheet.write(r + 1, c, val)
-            
-            # 加密
-            workbook.set_encryption(pwd)
-            workbook.close()
-            output.seek(0)
-            processed.append((f"加密_{f.name}", output.getvalue()))
-            
-        except Exception as e:
-            st.error(f"❌ {f.name} 失敗: {e}")
-        bar.progress((i + 1) / len(files))
-    return processed
 
 # ================= 3. 主介面 =================
 
-st.set_page_config(page_title="科普列車統計系統 V6.0", page_icon="📊", layout="wide")
-st.title("📊 科普列車 - 檢查與統計系統 V6.0")
+st.title("📊 科普列車 - 檢查與統計系統 V7.0")
+st.markdown("---")
 
-tab1, tab2 = st.tabs(["🔍 檢查與統計", "🔒 批次加密"])
+st.info("💡 說明：上傳 Excel 檔案後，系統會檢查格式（標記黃底）並自動產出 **Excel 統計報表**（各校師生人數）。")
 
-with tab1:
-    st.header("1. 名單檢查 & 自動統計")
-    st.info("系統會檢查格式錯誤(黃底)，並自動產出 **Excel 統計報表**。")
-    
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        pwd = st.text_input("檔案密碼 (若無則留空)", type="password", key="p1")
-    with c2:
-        files1 = st.file_uploader("上傳 Excel (支援多檔合併)", type=['xlsx'], accept_multiple_files=True, key="u1")
-    
-    if files1 and st.button("🚀 開始分析", key="b1"):
-        res, rep, big_df = run_checker_and_stats(files1, pwd)
-        
-        # --- 儀表板 ---
-        if not big_df.empty:
-            st.divider()
-            st.subheader("📈 數據儀表板")
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("總參與人數", f"{len(big_df)} 人")
-            col2.metric("涵蓋縣市", f"{big_df['縣市'].nunique()} 個")
-            col3.metric("參與學校", f"{big_df['學校'].nunique()} 所")
-            
-            chart1, chart2 = st.columns(2)
-            with chart1:
-                st.markdown("**各縣市人數**")
-                st.bar_chart(big_df['縣市'].value_counts())
-            with chart2:
-                st.markdown("**職稱/身分比例**")
-                st.bar_chart(big_df['職稱'].value_counts(), color="#ffaa00")
-            
-            # --- 產生統計 Excel ---
-            st.divider()
-            st.subheader("📥 下載專區")
-            
-            try:
-                pivot = big_df.pivot_table(index=['縣市', '學校'], columns='職稱', aggfunc='size', fill_value=0)
-                pivot['該校總計'] = pivot.sum(axis=1)
-                
-                stats_io = io.BytesIO()
-                with pd.ExcelWriter(stats_io, engine='xlsxwriter') as writer:
-                    pivot.to_excel(writer, sheet_name='各校統計')
-                    big_df['縣市'].value_counts().to_frame(name="人數").to_excel(writer, sheet_name='縣市統計')
-                    big_df.to_excel(writer, sheet_name='總名單明細', index=False)
-                    writer.sheets['各校統計'].set_column(0, 0, 15)
-                    writer.sheets['各校統計'].set_column(1, 1, 30)
-                
-                stats_io.seek(0)
-                
-                col_dl1, col_dl2 = st.columns(2)
-                with col_dl1:
-                    st.download_button("📊 下載統計報表 (.xlsx)", stats_io, "統計報表.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
-                    st.caption("包含：各校詳細統計、縣市分佈、總名單。")
-                    
-                with col_dl2:
-                    if res:
-                        z = io.BytesIO()
-                        with zipfile.ZipFile(z, "w") as zf:
-                            for n, d in res: zf.writestr(n, d)
-                            txt = "\n".join([f"{r['filename']}: {r['msg']}" for r in rep])
-                            zf.writestr("report.txt", txt)
-                        st.download_button("📦 下載已檢查原始檔 (ZIP)", z.getvalue(), "檢查結果_黃底.zip", "application/zip")
+col1, col2 = st.columns([1, 2])
+with col1:
+    pwd_input = st.text_input("檔案密碼 (若無則留空)", type="password", key="pwd_input")
+with col2:
+    files_input = st.file_uploader("請上傳 Excel (可多選合併計算)", type=['xlsx'], accept_multiple_files=True)
 
-            except Exception as e:
-                st.error(f"統計報表產生失敗: {e}")
-
-with tab2:
-    st.header("2. 批次加密")
-    st.warning("請上傳無密碼檔案。")
-    new_pwd = st.text_input("設定新密碼", type="password", key="p2")
-    files2 = st.file_uploader("上傳要加密的檔案", type=['xlsx'], accept_multiple_files=True, key="u2")
-    
-    if files2 and new_pwd:
-        if st.button("🔒 開始加密", key="b2"):
-            res = run_encryptor_native(files2, new_pwd)
-            if res:
-                st.success(f"處理完成 {len(res)} 個檔案")
+# 按下按鈕後，處理資料並存入 session_state
+if st.button("🚀 開始分析 & 產生報表", type="primary"):
+    if not files_input:
+        st.warning("請先上傳檔案！")
+    else:
+        with st.spinner("正在分析數據中..."):
+            res_files, meta_list, big_df = run_analysis(files_input, pwd_input)
+            
+            # 1. 處理檢查結果 ZIP
+            if res_files:
                 z = io.BytesIO()
                 with zipfile.ZipFile(z, "w") as zf:
-                    for n, d in res: zf.writestr(n, d)
-                st.download_button("📦 下載加密檔案", z.getvalue(), "已加密.zip", "application/zip")
+                    for n, d in res_files: zf.writestr(n, d)
+                    txt = "\n".join([f"{r['filename']}: {r['msg']}" for r in meta_list])
+                    zf.writestr("report.txt", txt)
+                st.session_state.result_zip = z.getvalue()
+            
+            # 2. 處理統計報表 Excel
+            if not big_df.empty:
+                try:
+                    stats_io = io.BytesIO()
+                    # 製作樞紐分析表
+                    pivot = big_df.pivot_table(index=['縣市', '學校'], columns='職稱', aggfunc='size', fill_value=0)
+                    pivot['該校總計'] = pivot.sum(axis=1)
+                    
+                    with pd.ExcelWriter(stats_io, engine='xlsxwriter') as writer:
+                        pivot.to_excel(writer, sheet_name='各校統計')
+                        big_df['縣市'].value_counts().to_frame(name="人數").to_excel(writer, sheet_name='縣市統計')
+                        big_df.to_excel(writer, sheet_name='總名單明細', index=False)
+                        
+                        # 美化欄寬
+                        writer.sheets['各校統計'].set_column(0, 0, 15)
+                        writer.sheets['各校統計'].set_column(1, 1, 30)
+                        
+                    st.session_state.stats_excel = stats_io.getvalue()
+                    st.session_state.big_df = big_df
+                except Exception as e:
+                    st.error(f"統計報表產生失敗: {e}")
+            
+            st.session_state.meta_report = meta_list
+            st.session_state.analysis_done = True
+
+# ================= 4. 結果顯示區 =================
+# 只有當分析完成後，這裡才會顯示。即使按了下載按鈕導致頁面重整，這裡的內容也會因為 session_state 而保留。
+
+if st.session_state.analysis_done:
+    st.divider()
+    
+    # --- 儀表板區 ---
+    if not st.session_state.big_df.empty:
+        df = st.session_state.big_df
+        st.subheader("📈 數據儀表板")
+        
+        m1, m2, m3 = st.columns(3)
+        m1.metric("總參與人數", f"{len(df)} 人")
+        m2.metric("涵蓋縣市", f"{df['縣市'].nunique()} 個")
+        m3.metric("參與學校", f"{df['學校'].nunique()} 所")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("各縣市報名人數")
+            st.bar_chart(df['縣市'].value_counts())
+        with c2:
+            st.caption("職稱比例")
+            st.bar_chart(df['職稱'].value_counts(), color="#ffaa00")
+
+    # --- 下載區 ---
+    st.subheader("📥 下載報告")
+    d1, d2 = st.columns(2)
+    
+    with d1:
