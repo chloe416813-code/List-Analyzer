@@ -294,3 +294,26 @@ if st.session_state.analysis_done:
     d1, d2 = st.columns(2)
     
     with d1:
+        if st.session_state.stats_excel:
+            st.download_button(
+                label="📊 下載統計報表 (.xlsx)",
+                data=st.session_state.stats_excel,
+                file_name="科普列車_統計報表.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"  # 醒目按鈕
+            )
+            st.caption("包含：各校詳細統計、縣市分佈、總名單。")
+            
+    with d2:
+        if st.session_state.result_zip:
+            st.download_button(
+                label="📦 下載已檢查原始檔 (ZIP)",
+                data=st.session_state.result_zip,
+                file_name="檢查結果_黃底標記.zip",
+                mime="application/zip"
+            )
+            st.caption("包含：檢查過並標記錯誤的 Excel 檔案。")
+            
+    # --- 詳細日誌 ---
+    with st.expander("查看詳細檢查日誌"):
+        st.dataframe(pd.DataFrame(st.session_state.meta_report))
