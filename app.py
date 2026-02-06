@@ -92,7 +92,7 @@ def extract_data(filename, content, password, user_cols_map):
 # ================= 2. 主介面 =================
 
 st.title("📊 科普列車 - 縣市學校統計戰情室 V12.0")
-st.markdown("### 專注目標：算出各縣市有【幾間學校】、【幾位老師】、【幾位學生】")
+
 
 # --- 左側設定區 ---
 with st.sidebar:
